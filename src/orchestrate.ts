@@ -11,7 +11,6 @@ import {
   parsePrEntry,
   buildPrReviewDocument,
   savePrDocument,
-  UPDATE_COOLDOWN_MS,
   REPOSITORY,
   PROJECT,
   DOCS_DIR,
@@ -24,6 +23,8 @@ import {
   status as poolStatus,
   WorktreeContext,
 } from "./worktree-pool";
+import { formatPrIdleAge, isPrIdle, PR_IDLE_THRESHOLD_HOURS } from "./pr-idle";
+import { formatPrReviewWait, getPrReviewDecision } from "./pr-review-policy";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -322,8 +323,9 @@ async function orchestrate(): Promise<{ succeeded: number; failed: number; total
 
   const now = Date.now();
   const state = loadState();
+  let idleCount = 0;
 
-  // Collect PRs that need review (new or source commit changed past cooldown)
+  // Collect PRs that need review after timing gates clear
   const prsToReview: {
     prId: number;
     sinceTimestamp: string | null;
@@ -335,38 +337,48 @@ async function orchestrate(): Promise<{ succeeded: number; failed: number; total
     const prId = pr.pullRequestId!;
     const key = String(prId);
 
-    // Use data from the list response — no individual getPullRequest call needed
-    const latestSourceCommitId: string = (pr as any).lastMergeSourceCommit?.commitId ?? "";
-    const lastPushDate = new Date(
-      (pr as any).lastMergeSourceCommit?.committer?.date ?? pr.creationDate ?? 0,
-    );
+    if (isPrIdle(pr, now)) {
+      idleCount++;
+      console.log(
+        `  [IDLE] PR #${prId} — no source activity for ${formatPrIdleAge(pr, now)}; ` +
+        `skipping PRs idle over ${PR_IDLE_THRESHOLD_HOURS}h`,
+      );
+      continue;
+    }
 
     const previousRaw = state.prs[key];
 
-    if (!previousRaw) {
-      prsToReview.push({ prId, sinceTimestamp: null, sourceCommitId: latestSourceCommitId, prData: pr });
-    } else {
-      const prev = parsePrEntry(previousRaw);
-      if (latestSourceCommitId && latestSourceCommitId !== prev.lastSourceCommitId) {
-        const msSincePush = now - lastPushDate.getTime();
-        if (msSincePush >= UPDATE_COOLDOWN_MS) {
-          prsToReview.push({ prId, sinceTimestamp: prev.lastReviewedAt, sourceCommitId: latestSourceCommitId, prData: pr });
-        } else {
-          const minsRemaining = Math.ceil((UPDATE_COOLDOWN_MS - msSincePush) / 60000);
-          console.log(`  [COOLDOWN] PR #${prId} — updated recently, eligible in ~${minsRemaining} min`);
-        }
-      }
+    const previous = previousRaw ? parsePrEntry(previousRaw) : null;
+    const decision = getPrReviewDecision(pr, previous, now);
+
+    if (decision.kind === "wait") {
+      console.log(`  [DEFER] PR #${prId} — ${formatPrReviewWait(decision)}`);
+      continue;
     }
+
+    if (decision.kind === "ignore") {
+      continue;
+    }
+
+    prsToReview.push({
+      prId,
+      sinceTimestamp: decision.sinceTimestamp,
+      sourceCommitId: decision.latestSourceCommitId,
+      prData: pr,
+    });
 
     if (prsToReview.length >= freeCount) break; // Don't exceed available worktrees
   }
 
   if (prsToReview.length === 0) {
-    console.log("\nNo PRs need review right now.");
+    console.log(`\nNo PRs need review right now.${idleCount > 0 ? ` Skipped ${idleCount} idle PR(s).` : ""}`);
     return { succeeded: 0, failed: 0, total: 0 };
   }
 
-  console.log(`\n${prsToReview.length} PR(s) to review (limited to ${freeCount} free worktrees).\n`);
+  console.log(
+    `\n${prsToReview.length} PR(s) to review (limited to ${freeCount} free worktrees).` +
+    `${idleCount > 0 ? ` Skipped ${idleCount} idle PR(s).` : ""}\n`,
+  );
 
   // 3. Load custom prompt
   const customPrompt = loadCustomPrompt();

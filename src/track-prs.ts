@@ -13,6 +13,11 @@ import * as path from "path";
 import * as os from "os";
 import "dotenv/config";
 import { acquireForPr, release, WorktreeContext } from "./worktree-pool";
+import { formatPrIdleAge, isPrIdle, PR_IDLE_THRESHOLD_HOURS } from "./pr-idle";
+import {
+  formatPrReviewWait,
+  getPrReviewDecision,
+} from "./pr-review-policy";
 
 // Enable encrypted persistent token cache (DPAPI on Windows, Keychain on macOS)
 try {
@@ -116,8 +121,6 @@ async function createConnection(): Promise<azdev.WebApi> {
 // ---------------------------------------------------------------------------
 // State persistence
 // ---------------------------------------------------------------------------
-const UPDATE_COOLDOWN_MS = 15 * 60 * 1000;
-
 interface PrStateEntry {
   lastReviewedAt: string;
   lastSourceCommitId: string;
@@ -456,7 +459,7 @@ async function onPullRequestEvent(
 }
 
 // ---------------------------------------------------------------------------
-// Core: fetch active non-draft PRs, detect new + updated (15 min cooldown)
+// Core: fetch active non-draft PRs, applying creation/update settle delay and re-review cooldown
 // ---------------------------------------------------------------------------
 async function checkForNewPRs(): Promise<void> {
   const connection = await createConnection();
@@ -473,38 +476,46 @@ async function checkForNewPRs(): Promise<void> {
   let newCount = 0;
   let updatedCount = 0;
   let skippedCount = 0;
+  let idleCount = 0;
 
   for (const pr of activePRs) {
     const prId = pr.pullRequestId!;
     const key = String(prId);
 
-    // Use data from the list response — no individual getPullRequest call needed
-    const latestSourceCommitId: string = (pr as any).lastMergeSourceCommit?.commitId ?? "";
-    const lastPushDate = new Date(
-      (pr as any).lastMergeSourceCommit?.committer?.date ?? pr.creationDate ?? 0,
-    );
+    if (isPrIdle(pr, now)) {
+      idleCount++;
+      console.log(
+        `[IDLE] #${prId} — no source activity for ${formatPrIdleAge(pr, now)}; ` +
+        `skipping PRs idle over ${PR_IDLE_THRESHOLD_HOURS}h`,
+      );
+      continue;
+    }
 
     const previousRaw = state.prs[key];
 
-    if (!previousRaw) {
-      await onPullRequestEvent(gitApi, "new", prId, null, pr);
-      state.prs[key] = { lastReviewedAt: new Date().toISOString(), lastSourceCommitId: latestSourceCommitId };
+    const previous = previousRaw ? parsePrEntry(previousRaw) : null;
+    const decision = getPrReviewDecision(pr, previous, now);
+
+    if (decision.kind === "wait") {
+      console.log(`[DEFER] #${prId} — ${formatPrReviewWait(decision)}`);
+      skippedCount++;
+      continue;
+    }
+
+    if (decision.kind === "ignore") {
+      continue;
+    }
+
+    const event: PrEvent = decision.kind === "review-new" ? "new" : "updated";
+    await onPullRequestEvent(gitApi, event, prId, decision.sinceTimestamp, pr);
+    state.prs[key] = {
+      lastReviewedAt: new Date().toISOString(),
+      lastSourceCommitId: decision.latestSourceCommitId,
+    };
+    if (decision.kind === "review-new") {
       newCount++;
     } else {
-      const prev = parsePrEntry(previousRaw);
-      if (latestSourceCommitId && latestSourceCommitId !== prev.lastSourceCommitId) {
-        const msSincePush = now - lastPushDate.getTime();
-        if (msSincePush >= UPDATE_COOLDOWN_MS) {
-          await onPullRequestEvent(gitApi, "updated", prId, prev.lastReviewedAt, pr);
-          state.prs[key] = { lastReviewedAt: new Date().toISOString(), lastSourceCommitId: latestSourceCommitId };
-          updatedCount++;
-        } else {
-          const minsRemaining = Math.ceil((UPDATE_COOLDOWN_MS - msSincePush) / 60000);
-          console.log(`[COOLDOWN] #${prId} — updated recently, will pick up in ~${minsRemaining} min`);
-          skippedCount++;
-          continue;
-        }
-      }
+      updatedCount++;
     }
   }
 
@@ -520,7 +531,8 @@ async function checkForNewPRs(): Promise<void> {
   saveState(state);
 
   console.log(
-    `\nSummary: ${newCount} new, ${updatedCount} updated, ${skippedCount} in cooldown. ` +
+    `\nSummary: ${newCount} new, ${updatedCount} updated, ${skippedCount} in cooldown, ` +
+    `${idleCount} idle over ${PR_IDLE_THRESHOLD_HOURS}h. ` +
     `Tracking ${Object.keys(state.prs).length} PR(s).`,
   );
 
@@ -547,7 +559,6 @@ export {
   onPullRequestEvent,
   checkForNewPRs,
   activeJobs,
-  UPDATE_COOLDOWN_MS,
   REPOSITORY,
   PROJECT,
   STATE_FILE,

@@ -18,6 +18,11 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import "dotenv/config";
+import { formatPrIdleAge, isPrIdle, PR_IDLE_THRESHOLD_HOURS } from "./pr-idle";
+import {
+  formatPrReviewWait,
+  getPrReviewDecision,
+} from "./pr-review-policy";
 
 // Enable encrypted persistent token cache
 try {
@@ -36,7 +41,6 @@ const RESULTS_DIR = path.join(__dirname, "..", "review-results");
 const CUSTOM_PROMPT_FILE = path.join(__dirname, "..", "review-prompt.md");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MINUTES ?? "10", 10) * 60 * 1000;
 const REVIEW_TIMEOUT_MS = 30 * 60 * 1000;
-const UPDATE_COOLDOWN_MS = 15 * 60 * 1000;
 const WARMUP_STAGGER_MS = parseInt(process.env.WARMUP_STAGGER_SECONDS ?? "30", 10) * 1000;
 const MIN_REVIEW_LENGTH = 200;
 const AZURE_DEVOPS_SCOPE = "499b84ac-1321-427f-aa17-267ca6975798/.default";
@@ -880,6 +884,7 @@ class RepoPipeline {
 
     const now = Date.now();
     let enqueued = 0;
+    let idleSkipped = 0;
 
     for (const pr of activePRs) {
       // Stop enqueuing if we've hit the per-repo limit
@@ -888,29 +893,37 @@ class RepoPipeline {
       const prId = pr.pullRequestId!;
       const key = String(prId);
 
-      // Use data from the list response — no individual getPullRequest call needed
-      const latestSourceCommitId: string = (pr as any).lastMergeSourceCommit?.commitId ?? "";
-      const lastPushDate = new Date(
-        (pr as any).lastMergeSourceCommit?.committer?.date ?? pr.creationDate ?? 0,
-      );
+      if (isPrIdle(pr, now)) {
+        idleSkipped++;
+        log(
+          this.repo.name,
+          `[IDLE] PR #${prId} — no source activity for ${formatPrIdleAge(pr, now)}; ` +
+          `skipping PRs idle over ${PR_IDLE_THRESHOLD_HOURS}h`,
+        );
+        continue;
+      }
 
       const previousRaw = this.state.prs[key];
 
-      if (!previousRaw) {
-        // New PR — review immediately
-        this.enqueue({ prId, sinceTimestamp: null, sourceCommitId: latestSourceCommitId, prData: pr });
-        enqueued++;
-      } else {
-        const prev = parsePrEntry(previousRaw);
-        if (latestSourceCommitId && latestSourceCommitId !== prev.lastSourceCommitId) {
-          // Source commit changed — new code was pushed
-          const msSincePush = now - lastPushDate.getTime();
-          if (msSincePush >= UPDATE_COOLDOWN_MS) {
-            this.enqueue({ prId, sinceTimestamp: prev.lastReviewedAt, sourceCommitId: latestSourceCommitId, prData: pr });
-            enqueued++;
-          }
-        }
+      const previous = previousRaw ? parsePrEntry(previousRaw) : null;
+      const decision = getPrReviewDecision(pr, previous, now);
+
+      if (decision.kind === "wait") {
+        log(this.repo.name, `[DEFER] PR #${prId} — ${formatPrReviewWait(decision)}`);
+        continue;
       }
+
+      if (decision.kind === "ignore") {
+        continue;
+      }
+
+      this.enqueue({
+        prId,
+        sinceTimestamp: decision.sinceTimestamp,
+        sourceCommitId: decision.latestSourceCommitId,
+        prData: pr,
+      });
+      enqueued++;
     }
 
     // Clean up PRs no longer active (state + work item cache)
@@ -925,7 +938,11 @@ class RepoPipeline {
     saveState(this.repo.repository, this.state);
 
     const watchMs = Date.now() - apiStart;
-    log(this.repo.name, `[Watch] Scan complete in ${watchMs}ms — enqueued ${enqueued} PR(s), queue depth: ${this.queue.length}`);
+    log(
+      this.repo.name,
+      `[Watch] Scan complete in ${watchMs}ms — enqueued ${enqueued} PR(s), ` +
+      `skipped ${idleSkipped} idle PR(s), queue depth: ${this.queue.length}`,
+    );
   }
 
   private enqueue(job: ReviewJob): void {
