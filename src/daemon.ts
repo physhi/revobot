@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { execSync } from "child_process";
 import * as azdev from "azure-devops-node-api";
+import { BearerCredentialHandler } from "azure-devops-node-api/handlers/bearertoken";
 import { IGitApi } from "azure-devops-node-api/GitApi";
 import { IWorkItemTrackingApi } from "azure-devops-node-api/WorkItemTrackingApi";
 import { WorkItemExpand } from "azure-devops-node-api/interfaces/WorkItemTrackingInterfaces";
@@ -29,6 +30,38 @@ try {
   useIdentityPlugin(cachePersistencePlugin);
 } catch {
   // Already registered
+}
+
+// ===========================================================================
+// Auto-refreshing bearer token handler
+// ===========================================================================
+// Entra ID access tokens expire after ~1h. The daemon runs indefinitely, so
+// the static token baked into BearerCredentialHandler goes stale.  This
+// subclass intercepts 401 responses, silently refreshes the token via the
+// cached InteractiveBrowserCredential, and retries the request.
+class AutoRefreshBearerHandler extends BearerCredentialHandler {
+  private credential: InteractiveBrowserCredential;
+  private scope: string;
+
+  constructor(initialToken: string, credential: InteractiveBrowserCredential, scope: string) {
+    super(initialToken);
+    this.credential = credential;
+    this.scope = scope;
+  }
+
+  canHandleAuthentication(response: { message?: { statusCode?: number } }): boolean {
+    return response?.message?.statusCode === 401;
+  }
+
+  async handleAuthentication(httpClient: any, requestInfo: any, data: any): Promise<any> {
+    const fresh = await this.credential.getToken(this.scope);
+    if (fresh) {
+      this.token = fresh.token;
+      console.log("[Auth] Token refreshed silently after 401.");
+    }
+    requestInfo.options.headers["Authorization"] = `Bearer ${this.token}`;
+    return httpClient.requestRaw(requestInfo, data);
+  }
 }
 
 // ===========================================================================
@@ -118,7 +151,9 @@ async function createConnection(orgUrl: string): Promise<azdev.WebApi> {
     return new azdev.WebApi(orgUrl, azdev.getPersonalAccessTokenHandler(pat));
   }
 
-  // Entra ID flow: try silent auth first, then interactive browser
+  // Entra ID flow: try silent auth first, then interactive browser.
+  // The credential is kept alive so AutoRefreshBearerHandler can silently
+  // refresh the token on 401 without opening a browser.
   const credentialOptions = {
     redirectUri: "http://localhost",
     tokenCachePersistenceOptions: { enabled: true },
@@ -127,15 +162,16 @@ async function createConnection(orgUrl: string): Promise<azdev.WebApi> {
   const existingRecord = loadAuthRecord(orgUrl);
   if (existingRecord) {
     try {
-      const probe = new InteractiveBrowserCredential({
+      const credential = new InteractiveBrowserCredential({
         ...credentialOptions,
         authenticationRecord: existingRecord,
         disableAutomaticAuthentication: true,
       });
-      const token = await probe.getToken(AZURE_DEVOPS_SCOPE);
+      const token = await credential.getToken(AZURE_DEVOPS_SCOPE);
       if (token) {
-        console.log("[Auth] Silent authentication succeeded.");
-        return new azdev.WebApi(orgUrl, azdev.getHandlerFromToken(token.token));
+        console.log("[Auth] Silent authentication succeeded (auto-refresh enabled).");
+        const handler = new AutoRefreshBearerHandler(token.token, credential, AZURE_DEVOPS_SCOPE);
+        return new azdev.WebApi(orgUrl, handler);
       }
     } catch {
       console.log("[Auth] Cached token expired, falling back to interactive login.");
@@ -150,7 +186,15 @@ async function createConnection(orgUrl: string): Promise<azdev.WebApi> {
     console.log("[Auth] Authentication record saved.");
   }
   const token = await credential.getToken(AZURE_DEVOPS_SCOPE);
-  return new azdev.WebApi(orgUrl, azdev.getHandlerFromToken(token!.token));
+
+  // For ongoing refresh, create a silent-only credential with the auth record
+  const silentCredential = new InteractiveBrowserCredential({
+    ...credentialOptions,
+    authenticationRecord: authRecord ?? existingRecord,
+    disableAutomaticAuthentication: true,
+  });
+  const handler = new AutoRefreshBearerHandler(token!.token, silentCredential, AZURE_DEVOPS_SCOPE);
+  return new azdev.WebApi(orgUrl, handler);
 }
 
 // ===========================================================================
