@@ -19,3 +19,5 @@ sessions.jsonl
 .worktree-pool/
 wi-cache/
 scratchpad/
+.mcp-review.json
+dev-state-*.json

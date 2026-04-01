@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "build": "tsc",
     "track-prs": "ts-node src/track-prs.ts",
     "query-pr": "ts-node src/query-pr.ts",
@@ -12,7 +13,11 @@
     "review": "ts-node src/orchestrate.ts",
     "daemon": "ts-node src/daemon.ts",
     "daemon:once": "ts-node src/daemon.ts once",
-    "dashboard": "ts-node src/daemon.ts dashboard"
+    "dashboard": "ts-node src/daemon.ts dashboard",
+    "dev-daemon": "ts-node src/dev-daemon.ts",
+    "dev-daemon:once": "ts-node src/dev-daemon.ts once",
+    "dev-daemon:dashboard": "ts-node src/dev-daemon.ts dashboard",
+    "extract-knowledge": "ts-node src/extract-knowledge.ts"
   },
   "keywords": [],
   "author": "",
@@ -26,5 +31,8 @@
     "dotenv": "^17.3.1",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.2"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.2"
   }
 }
