@@ -26,6 +26,7 @@ import {
   buildSummarizePrompt, buildKnowledgeExtractionPrompt,
   parseResultBlock, extractPrIdFallback,
 } from "./dev-prompts";
+import { writeMcpConfig } from "./mcp-config";
 
 // ═══════════════════════════════════════════════════════════════════
 // Identity cache persistence
@@ -309,8 +310,6 @@ function ensureWorkItemWorktree(repoPath: string, workItemId: number, repoName: 
  */
 function cleanupWorkItemWorktree(worktreePath: string, repoPath: string): void {
   try {
-    // Clean up MCP config
-    try { fs.unlinkSync(path.join(worktreePath, ".mcp-review.json")); } catch { /* may not exist */ }
     execSync(`git worktree remove --force "${worktreePath}"`, { cwd: repoPath, encoding: "utf-8" });
     log("Worktree", `Removed worktree: ${worktreePath}`);
   } catch (err: any) {
@@ -584,23 +583,8 @@ function runClaude(
     const env = { ...process.env };
     delete env.CLAUDECODE;
 
-    // MCP config
-    const mcpConfigPath = path.join(cwd, ".mcp-review.json");
-    fs.writeFileSync(mcpConfigPath, JSON.stringify({
-      mcpServers: {
-        "azure-devops": {
-          type: "stdio", command: "cmd",
-          args: ["/c", "npx", "-y", "@achieveai/azuredevops-mcp@1.3.18"],
-          env: {
-            AZURE_DEVOPS_ORG_URL: repo.orgUrl,
-            AZURE_DEVOPS_PROJECT: repo.project,
-            AZURE_DEVOPS_REPOSITORY: repo.repository,
-            AZURE_DEVOPS_IS_ON_PREMISES: "false",
-            ...(process.env.AZURE_DEVOPS_PAT ? { AZURE_DEVOPS_PAT: process.env.AZURE_DEVOPS_PAT } : {}),
-          },
-        },
-      },
-    }, null, 2));
+    // MCP config (resolved from template)
+    const mcpConfigPath = writeMcpConfig(".mcp-dev.json", repo);
 
     const child = spawn("claude", [
       "-p", "--dangerously-skip-permissions", "--model", "opus",

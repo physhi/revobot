@@ -24,6 +24,7 @@ import {
   formatPrReviewWait,
   getPrReviewDecision,
 } from "./pr-review-policy";
+import { writeMcpConfig } from "./mcp-config";
 
 // Enable encrypted persistent token cache
 try {
@@ -278,9 +279,6 @@ function acquireSlot(pool: WorktreePool): WorktreeSlot | null {
 }
 
 function releaseSlot(pool: WorktreePool, slot: WorktreeSlot): void {
-  // Clean up MCP config that may contain PAT
-  try { fs.unlinkSync(path.join(slot.path, ".mcp-review.json")); } catch { /* may not exist */ }
-
   gitSafe("clean -fd", slot.path);
   const checkout = gitSafe("checkout --detach HEAD", slot.path);
   gitSafe("clean -fd", slot.path);
@@ -788,24 +786,8 @@ function runClaude(
     const env = { ...process.env };
     delete env.CLAUDECODE;
 
-    // MCP config file
-    const mcpConfigPath = path.join(cwd, ".mcp-review.json");
-    fs.writeFileSync(mcpConfigPath, JSON.stringify({
-      mcpServers: {
-        "azure-devops": {
-          type: "stdio", command: "cmd",
-          args: ["/c", "npx", "-y", "@achieveai/azuredevops-mcp@1.3.18"],
-          env: {
-            AZURE_DEVOPS_ORG_URL: repo.orgUrl,
-            AZURE_DEVOPS_PROJECT: repo.project,
-            AZURE_DEVOPS_REPOSITORY: repo.repository,
-            AZURE_DEVOPS_IS_ON_PREMISES: "false",
-            ...(process.env.AZURE_DEVOPS_PAT ? { AZURE_DEVOPS_PAT: process.env.AZURE_DEVOPS_PAT } : {}),
-          },
-        },
-        // ...(agencyPath ? { "bluebird": { type: "stdio", command: agencyPath, args: ["mcp", "bluebird"] } } : {}),
-      },
-    }, null, 2));
+    // MCP config file (resolved from template)
+    const mcpConfigPath = writeMcpConfig(".mcp-review.json", repo);
 
     const child = spawn("claude", [
       "-p", "--dangerously-skip-permissions", "--model", "opus",
