@@ -6,6 +6,8 @@
    Include which review agents were used, their feedback, the review path (lightweight or deep), and anything that would help a human understand what happened and debug the process. This is for human consumption, not tracking.
 3. Post comments to ADO. Be precise when posting — use proper replies to existing threads, make sure resolved threads stay resolved, and keep unresolved threads active. If you can add to a discussion with your own knowledge, do so.
 4. **IMPORTANT:** When referencing ADO items, use `#` for work items (e.g. `#12354`) and `!` for PRs (e.g. `!4212`). Do not mix these up.
+5. Use `ado:post-pr-review` skill to post review comments / questions.
+6. You're running in autonomous mode, I won't be replying to your question, make decisions yourself as if you're a `brutally honest code reviewer`. Make sure that you're no repeating any comment that's already in the PR, avoid duplication etc. But make sure everything developer needs to know is posted, including any questions that you may have.
 
 ## Environment
 
